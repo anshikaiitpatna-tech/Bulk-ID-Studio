@@ -79,9 +79,6 @@ export async function parseSpreadsheet(file: File): Promise<SpreadsheetData> {
     Object.fromEntries(Object.entries(row).map(([key, value]) => [key.trim(), String(value ?? '').trim()])),
   );
 
-  // Excel 365 stores images inserted into cells as rich-data values rather than
-  // ordinary cell text. SheetJS 0.18.x does not expose those images through
-  // sheet_to_json(), so inspect the XLSX package and recover the embedded media.
   const embeddedPhotos: Record<number, File> = {};
   try {
     const zip = await JSZip.loadAsync(buffer);
@@ -111,14 +108,14 @@ export async function parseSpreadsheet(file: File): Promise<SpreadsheetData> {
         const extension = mediaName.split('.').pop()?.toLowerCase() ?? 'png';
         const mime = extension === 'jpg' || extension === 'jpeg' ? 'image/jpeg' : extension === 'webp' ? 'image/webp' : extension === 'gif' ? 'image/gif' : 'image/png';
         const rowNumber = Number(ref.match(/\d+$/)?.[0]);
-        const dataRowIndex = rowNumber - 2; // row 1 is the header
+        const dataRowIndex = rowNumber - 2;
         if (dataRowIndex >= 0 && dataRowIndex < rows.length) {
           embeddedPhotos[dataRowIndex] = new File([blob], mediaName.split('/').pop() ?? mediaName, { type: mime });
         }
       }
     }
   } catch {
-    // Keep normal spreadsheet parsing functional even if embedded-image recovery fails.
+    // Keep normal spreadsheet parsing functional
   }
 
   return { headers: Object.keys(rows[0] ?? {}), rows, embeddedPhotos };
@@ -172,11 +169,24 @@ export function renderSvgForRow(template: ParsedTemplate, row: SpreadsheetRow, m
     const header = mappings[token];
     return header && header !== '__ignore__' ? escapeXml(row[header] ?? '') : '';
   });
+
   if (template.photoPlaceholder && photoData) {
-    const { x, y, width, height } = template.photoPlaceholder;
-    const image = `<image href="${photoData}" x="${x}" y="${y}" width="${width}" height="${height}" preserveAspectRatio="xMidYMid slice" data-generated-photo="true" />`;
-    svg = svg.replace(/<\/svg\s*>/i, `${image}</svg>`);
+    const doc = new DOMParser().parseFromString(svg, 'image/svg+xml');
+
+    const photoElement =
+      doc.querySelector('#photo-placeholder') ||
+      doc.querySelector('[data-placeholder="photo"]');
+
+    if (photoElement) {
+      photoElement.setAttribute('href', photoData);
+      photoElement.setAttribute('preserveAspectRatio', 'xMidYMid slice');
+      photoElement.setAttribute('data-generated-photo', 'true');
+      photoElement.removeAttribute('xlink:href');
+
+      svg = new XMLSerializer().serializeToString(doc);
+    }
   }
+
   return svg;
 }
 
