@@ -21,18 +21,42 @@ function numeric(value: string | null, fallback: number) {
   return Number.isFinite(parsed) ? parsed : fallback;
 }
 
+// Canva split tspans fix
+function sanitizeCanvaSvg(rawSvg: string): string {
+  let cleaned = rawSvg;
+  // Merges tspans inside {{ ... }} tags split by Canva
+  cleaned = cleaned.replace(/(<text[^>]*>)[\s\S]*?(<\/text>)/gi, (fullMatch) => {
+    const textContentOnly = fullMatch.replace(/<[^>]+>/g, '');
+    if (/\{\{[\s\S]*?\}\}/.test(textContentOnly)) {
+      return fullMatch.replace(/<\/tspan>\s*<tspan[^>]*>/gi, '');
+    }
+    return fullMatch;
+  });
+  return cleaned;
+}
+
 export function parseSvgTemplate(rawSvg: string): ParsedTemplate {
+  const sanitizedSvg = sanitizeCanvaSvg(rawSvg);
   const found = new Set<string>();
-  for (const match of rawSvg.matchAll(/\{\{\s*([^}]+?)\s*\}\}/g)) found.add(cleanToken(match[1]));
-  const doc = new DOMParser().parseFromString(rawSvg, 'image/svg+xml');
+
+  for (const match of sanitizedSvg.matchAll(/\{\{\s*([^}]+?)\s*\}\}/g)) {
+    found.add(cleanToken(match[1]));
+  }
+
+  const doc = new DOMParser().parseFromString(sanitizedSvg, 'image/svg+xml');
   let photo: PhotoPlaceholder | undefined;
   const elements = Array.from(doc.querySelectorAll('*'));
+
   for (const element of elements) {
     const text = element.textContent?.trim() ?? '';
     const id = element.getAttribute('id')?.toLowerCase() ?? '';
     const placeholder = element.getAttribute('data-placeholder')?.toLowerCase() ?? '';
     const isPhotoToken = element.tagName.toLowerCase() === 'text' && /\{\{\s*photo\s*\}\}/i.test(text);
-    const isPhoto = id === 'photo-placeholder' || placeholder === 'photo' || isPhotoToken;
+    
+    // Automatic detection for Canva landscape image or photo placeholder
+    const isImageElement = element.tagName.toLowerCase() === 'image';
+    const isPhoto = id === 'photo-placeholder' || placeholder === 'photo' || isPhotoToken || isImageElement;
+    
     if (!isPhoto) continue;
 
     found.add('Photo');
@@ -57,11 +81,13 @@ export function parseSvgTemplate(rawSvg: string): ParsedTemplate {
     photo = { x, y, width: resolvedWidth, height: resolvedHeight, source: geometry?.tagName.toLowerCase() ?? element.tagName.toLowerCase() };
     break;
   }
+
   if (!photo && found.has('Photo')) {
     const viewBox = doc.documentElement.getAttribute('viewBox')?.split(/\s+/).map(Number);
     photo = { x: (viewBox?.[2] ?? 640) / 2 - 60, y: (viewBox?.[3] ?? 900) / 2 - 75, width: 120, height: 150, source: 'token' };
   }
-  return { rawSvg, tokens: Array.from(found), photoPlaceholder: photo };
+
+  return { rawSvg: sanitizedSvg, tokens: Array.from(found), photoPlaceholder: photo };
 }
 
 export async function parseSpreadsheet(file: File): Promise<SpreadsheetData> {
@@ -115,7 +141,7 @@ export async function parseSpreadsheet(file: File): Promise<SpreadsheetData> {
       }
     }
   } catch {
-    // Keep normal spreadsheet parsing functional
+    // Keep normal spreadsheet functional
   }
 
   return { headers: Object.keys(rows[0] ?? {}), rows, embeddedPhotos };
@@ -175,7 +201,8 @@ export function renderSvgForRow(template: ParsedTemplate, row: SpreadsheetRow, m
 
     const photoElement =
       doc.querySelector('#photo-placeholder') ||
-      doc.querySelector('[data-placeholder="photo"]');
+      doc.querySelector('[data-placeholder="photo"]') ||
+      doc.querySelector('image');
 
     if (photoElement) {
       photoElement.setAttribute('href', photoData);
