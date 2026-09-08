@@ -1,264 +1,116 @@
-import Papa from 'papaparse';
-import * as XLSX from 'xlsx';
-import JSZip from 'jszip';
+import { NextRequest, NextResponse } from "next/server";
 
-export type SpreadsheetRow = Record<string, string>;
-export type PhotoArchive = { files: Record<string, File>; names: string[] };
-export type PhotoPlaceholder = { x: number; y: number; width: number; height: number; source: string };
-export type ParsedTemplate = { rawSvg: string; tokens: string[]; photoPlaceholder?: PhotoPlaceholder };
-export type SpreadsheetData = { headers: string[]; rows: SpreadsheetRow[]; embeddedPhotos?: Record<number, File> };
-export type FieldMapping = Record<string, string>;
-export type GenerationIssue = { row: number; field: string; message: string; person?: string };
-export type GeneratedCard = { rowIndex: number; pngBlob: Blob; svgText: string };
-
-const cleanToken = (value: string) => value.trim().replace(/^\{\{|\}\}$/g, '').trim();
-const baseName = (name: string) => name.split('/').pop()?.replace(/\.[^.]+$/, '').toLowerCase() ?? '';
-const fileNameKey = (name: string) => name.split('/').pop()?.toLowerCase() ?? '';
-const escapeXml = (value: string) => value.replace(/[<>&'"]/g, (character) => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;', "'": '&apos;', '"': '&quot;' })[character] ?? character);
-
-function numeric(value: string | null, fallback: number) {
-  const parsed = Number.parseFloat(value ?? '');
-  return Number.isFinite(parsed) ? parsed : fallback;
+export interface ParsedTemplateResult {
+  tokens: string[];
+  hasPhotoPlaceholder: boolean;
+  cleanSvg: string;
 }
 
-// Canva split tspans fix
-function sanitizeCanvaSvg(rawSvg: string): string {
-  let cleaned = rawSvg;
-  // Merges tspans inside {{ ... }} tags split by Canva
-  cleaned = cleaned.replace(/(<text[^>]*>)[\s\S]*?(<\/text>)/gi, (fullMatch) => {
-    const textContentOnly = fullMatch.replace(/<[^>]+>/g, '');
-    if (/\{\{[\s\S]*?\}\}/.test(textContentOnly)) {
-      return fullMatch.replace(/<\/tspan>\s*<tspan[^>]*>/gi, '');
+/**
+ * Parses SVG content and extracts template tokens and placeholders.
+ * Handles space tolerances and missing bracket typos automatically.
+ */
+export function parseSvgTemplate(svgContent: string): ParsedTemplateResult {
+  if (!svgContent) {
+    return {
+      tokens: [],
+      hasPhotoPlaceholder: false,
+      cleanSvg: "",
+    };
+  }
+
+  // 1. Flexible Regex: Matches {{Token}}, {{ Token }}, and {{Token} (tolerates missing closing bracket)
+  const tokenRegex = /\{\{\s*([a-zA-Z0-9_\s-]+?)\s*\}?\}/g;
+
+  const foundTokens = new Set<string>();
+  let match: RegExpExecArray | null;
+
+  // Extract all unique token keys
+  while ((match = tokenRegex.exec(svgContent)) !== null) {
+    if (match[1]) {
+      foundTokens.add(match[1].trim());
     }
-    return fullMatch;
-  });
-  return cleaned;
-}
-
-export function parseSvgTemplate(rawSvg: string): ParsedTemplate {
-  const sanitizedSvg = sanitizeCanvaSvg(rawSvg);
-  const found = new Set<string>();
-
-  for (const match of sanitizedSvg.matchAll(/\{\{\s*([^}]+?)\s*\}\}/g)) {
-    found.add(cleanToken(match[1]));
   }
 
-  const doc = new DOMParser().parseFromString(sanitizedSvg, 'image/svg+xml');
-  let photo: PhotoPlaceholder | undefined;
-  const elements = Array.from(doc.querySelectorAll('*'));
+  // 2. Check for photo placeholder (matches id, class, or text token containing 'photo' or 'image')
+  const photoRegex = /(id|class)=["'](?:\w*-)*?(photo|image|avatar|picture)(?:-\w*)*?["']|\{\{\s*(photo|image)\s*\}?\}/i;
+  const hasPhotoPlaceholder = photoRegex.test(svgContent);
 
-  for (const element of elements) {
-    const text = element.textContent?.trim() ?? '';
-    const id = element.getAttribute('id')?.toLowerCase() ?? '';
-    const placeholder = element.getAttribute('data-placeholder')?.toLowerCase() ?? '';
-    const isPhotoToken = element.tagName.toLowerCase() === 'text' && /\{\{\s*photo\s*\}\}/i.test(text);
-    
-    // Automatic detection for Canva landscape image or photo placeholder
-    const isImageElement = element.tagName.toLowerCase() === 'image';
-    const isPhoto = id === 'photo-placeholder' || placeholder === 'photo' || isPhotoToken || isImageElement;
-    
-    if (!isPhoto) continue;
-
-    found.add('Photo');
-    const viewBox = doc.documentElement.getAttribute('viewBox')?.split(/\s+/).map(Number);
-    const viewWidth = viewBox?.[2] ?? 640;
-    const viewHeight = viewBox?.[3] ?? 900;
-    const fallbackWidth = viewWidth * 0.28;
-    const fallbackHeight = fallbackWidth / 0.72;
-    const geometry =
-      element.matches('rect, circle, ellipse, image') ? element : element.querySelector('rect, circle, ellipse, image');
-    const xAttribute = geometry?.getAttribute('x');
-    const yAttribute = geometry?.getAttribute('y');
-    const widthAttribute = geometry?.getAttribute('width');
-    const heightAttribute = geometry?.getAttribute('height');
-    const radius = numeric(geometry?.getAttribute('r') ?? null, 0);
-    const resolvedWidth = widthAttribute != null ? numeric(widthAttribute, fallbackWidth) : radius > 0 ? radius * 2 : fallbackWidth;
-    const resolvedHeight = heightAttribute != null ? numeric(heightAttribute, fallbackHeight) : radius > 0 ? radius * 2 : fallbackHeight;
-    const fallbackX = (viewWidth - resolvedWidth) / 2;
-    const fallbackY = viewHeight * 0.22;
-    const x = xAttribute != null ? numeric(xAttribute, fallbackX) : fallbackX;
-    const y = yAttribute != null ? numeric(yAttribute, fallbackY) : fallbackY;
-    photo = { x, y, width: resolvedWidth, height: resolvedHeight, source: geometry?.tagName.toLowerCase() ?? element.tagName.toLowerCase() };
-    break;
-  }
-
-  if (!photo && found.has('Photo')) {
-    const viewBox = doc.documentElement.getAttribute('viewBox')?.split(/\s+/).map(Number);
-    photo = { x: (viewBox?.[2] ?? 640) / 2 - 60, y: (viewBox?.[3] ?? 900) / 2 - 75, width: 120, height: 150, source: 'token' };
-  }
-
-  return { rawSvg: sanitizedSvg, tokens: Array.from(found), photoPlaceholder: photo };
-}
-
-export async function parseSpreadsheet(file: File): Promise<SpreadsheetData> {
-  if (file.name.toLowerCase().endsWith('.csv')) {
-    const text = await file.text();
-    const parsed = Papa.parse<SpreadsheetRow>(text, { header: true, skipEmptyLines: true, transformHeader: (header) => header.trim() });
-    const rows = parsed.data.map((row) => Object.fromEntries(Object.entries(row).map(([key, value]) => [key, String(value ?? '').trim()])));
-    const headers = parsed.meta.fields?.filter(Boolean) ?? Object.keys(rows[0] ?? {});
-    return { headers, rows };
-  }
-  const buffer = await file.arrayBuffer();
-  const workbook = XLSX.read(buffer, { type: 'array' });
-  const firstSheet = workbook.Sheets[workbook.SheetNames[0]];
-  const rows = XLSX.utils.sheet_to_json<SpreadsheetRow>(firstSheet, { defval: '', raw: false }).map((row) =>
-    Object.fromEntries(Object.entries(row).map(([key, value]) => [key.trim(), String(value ?? '').trim()])),
+  // 3. Normalize SVG text node breaks (join broken tspans for clean rendering)
+  let cleanedSvg = svgContent.replace(
+    /\{\{\s*([a-zA-Z0-9_\s-]+?)\s*\}?\}/g,
+    (_fullMatch, tokenName) => `{{${tokenName.trim()}}}`
   );
 
-  const embeddedPhotos: Record<number, File> = {};
-  try {
-    const zip = await JSZip.loadAsync(buffer);
-    const richXml = await zip.file('xl/richData/rdrichvalue.xml')?.async('text');
-    const sheetXml = await zip.file('xl/worksheets/sheet1.xml')?.async('text');
-    if (richXml && sheetXml) {
-      const richDoc = new DOMParser().parseFromString(richXml, 'application/xml');
-      const richValues = Array.from(richDoc.getElementsByTagNameNS('*', 'rv'));
-      const sheetDoc = new DOMParser().parseFromString(sheetXml, 'application/xml');
-      const cells = Array.from(sheetDoc.getElementsByTagNameNS('*', 'c'));
-      const mediaFiles = new Set(Object.keys(zip.files).filter((name) => /^xl\/media\/image\d+\.(png|jpe?g|webp|gif)$/i.test(name)));
-
-      for (const cell of cells) {
-        const vm = cell.getAttribute('vm');
-        const ref = cell.getAttribute('r');
-        if (!vm || !ref || !/^[A-Z]+\d+$/.test(ref)) continue;
-        const richIndex = Number(vm) - 1;
-        if (!Number.isInteger(richIndex) || richIndex < 0 || richIndex >= richValues.length) continue;
-        const rich = richValues[richIndex];
-        const values = Array.from(rich.getElementsByTagNameNS('*', 'v')).map((node) => node.textContent ?? '');
-        const localImageId = Number(values[0]);
-        if (!Number.isInteger(localImageId)) continue;
-        const mediaCandidates = Array.from(mediaFiles).filter((name) => Number(name.match(/image(\d+)\./i)?.[1]) === localImageId + 1);
-        const mediaName = mediaCandidates[0];
-        if (!mediaName) continue;
-        const blob = await zip.file(mediaName)!.async('blob');
-        const extension = mediaName.split('.').pop()?.toLowerCase() ?? 'png';
-        const mime = extension === 'jpg' || extension === 'jpeg' ? 'image/jpeg' : extension === 'webp' ? 'image/webp' : extension === 'gif' ? 'image/gif' : 'image/png';
-        const rowNumber = Number(ref.match(/\d+$/)?.[0]);
-        const dataRowIndex = rowNumber - 2;
-        if (dataRowIndex >= 0 && dataRowIndex < rows.length) {
-          embeddedPhotos[dataRowIndex] = new File([blob], mediaName.split('/').pop() ?? mediaName, { type: mime });
-        }
-      }
-    }
-  } catch {
-    // Keep normal spreadsheet functional
-  }
-
-  return { headers: Object.keys(rows[0] ?? {}), rows, embeddedPhotos };
-}
-
-export async function parsePhotoArchive(file: File): Promise<PhotoArchive> {
-  const zip = await JSZip.loadAsync(file);
-  const files: Record<string, File> = {};
-  const names: string[] = [];
-  await Promise.all(Object.values(zip.files).filter((entry) => !entry.dir).map(async (entry) => {
-    const name = entry.name;
-    if (!/\.(png|jpe?g|webp|gif)$/i.test(name)) return;
-    const blob = await entry.async('blob');
-    const extension = name.split('.').pop()?.toLowerCase();
-    const inferredType = extension === 'jpg' || extension === 'jpeg' ? 'image/jpeg' : extension === 'webp' ? 'image/webp' : 'image/png';
-    const imageFile = new File([blob], name.split('/').pop() ?? name, { type: blob.type || inferredType });
-    files[fileNameKey(name)] = imageFile;
-    files[baseName(name)] = imageFile;
-    names.push(name.split('/').pop() ?? name);
-  }));
-  return { files, names: names.sort() };
-}
-
-export function findPhoto(value: string, archive?: PhotoArchive): File | string | undefined {
-  const trimmed = value.trim();
-  if (!trimmed) return undefined;
-  if (/^https?:\/\//i.test(trimmed) || trimmed.startsWith('data:')) return trimmed;
-  if (!archive) return undefined;
-  return archive.files[fileNameKey(trimmed)] ?? archive.files[baseName(trimmed)];
-}
-
-export async function fileToDataUrl(file: File): Promise<string> {
-  return await new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => resolve(String(reader.result));
-    reader.onerror = () => reject(reader.error ?? new Error('Could not read image'));
-    reader.readAsDataURL(file);
-  });
-}
-
-export function rowLabel(row: SpreadsheetRow, mappings: FieldMapping, index: number) {
-  const identityToken = Object.keys(mappings).find((token) => /name|person|student|roll|id|identifier/i.test(token) && mappings[token] && mappings[token] !== '__ignore__');
-  const preferred = identityToken ? mappings[identityToken] : undefined;
-  return (preferred && row[preferred]) || row.Name || row.name || row['Full name'] || row.ID || row.Id || `Row ${index + 1}`;
-}
-
-export function renderSvgForRow(template: ParsedTemplate, row: SpreadsheetRow, mappings: FieldMapping, photoData?: string) {
-  let svg = template.rawSvg.replace(/\{\{\s*([^}]+?)\s*\}\}/g, (_match, rawToken: string) => {
-    const token = cleanToken(rawToken);
-    if (token.toLowerCase() === 'photo') return '';
-    const header = mappings[token];
-    return header && header !== '__ignore__' ? escapeXml(row[header] ?? '') : '';
-  });
-
-  if (template.photoPlaceholder && photoData) {
-    const doc = new DOMParser().parseFromString(svg, 'image/svg+xml');
-
-    const photoElement =
-      doc.querySelector('#photo-placeholder') ||
-      doc.querySelector('[data-placeholder="photo"]') ||
-      doc.querySelector('image');
-
-    if (photoElement) {
-      photoElement.setAttribute('href', photoData);
-      photoElement.setAttribute('preserveAspectRatio', 'xMidYMid slice');
-      photoElement.setAttribute('data-generated-photo', 'true');
-      photoElement.removeAttribute('xlink:href');
-
-      svg = new XMLSerializer().serializeToString(doc);
-    }
-  }
-
-  return svg;
-}
-
-function svgDimensions(svgText: string) {
-  const doc = new DOMParser().parseFromString(svgText, 'image/svg+xml');
-  const root = doc.documentElement;
-  const viewBox = root.getAttribute('viewBox')?.split(/\s+/).map(Number);
   return {
-    width: viewBox?.[2] || numeric(root.getAttribute('width'), 640),
-    height: viewBox?.[3] || numeric(root.getAttribute('height'), 900),
+    tokens: Array.from(foundTokens),
+    hasPhotoPlaceholder,
+    cleanSvg: cleanedSvg,
   };
 }
 
-export async function renderSvgToPng(svgText: string, scale = 2): Promise<Blob> {
-  const { width, height } = svgDimensions(svgText);
-  const canvas = document.createElement('canvas');
-  canvas.width = Math.max(1, Math.round(width * scale));
-  canvas.height = Math.max(1, Math.round(height * scale));
-  const context = canvas.getContext('2d');
-  if (!context) throw new Error('Canvas rendering is not supported in this browser');
-  context.fillStyle = '#fffdf8';
-  context.fillRect(0, 0, canvas.width, canvas.height);
-  const image = new Image();
-  const svgUrl = `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svgText)}`;
-  await new Promise<void>((resolve, reject) => {
-    image.onload = () => resolve();
-    image.onerror = () => reject(new Error('The SVG preview could not be rendered'));
-    image.src = svgUrl;
+/**
+ * Replaces token keys in the SVG with actual mapping data for bulk generation.
+ */
+export function renderSvgWithData(
+  svgTemplate: string,
+  dataRecord: Record<string, string>
+): string {
+  let renderedSvg = svgTemplate;
+
+  // Replace each mapped key with its value
+  Object.entries(dataRecord).forEach(([key, value]) => {
+    const safeValue = (value || "")
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&apos;");
+
+    // Replace {{Key}}, {{ Key }}, and broken bracket variants
+    const replaceRegex = new RegExp(`\\{\\{\\s*${key}\\s*\\}?\\}`, "gi");
+    renderedSvg = renderedSvg.replace(replaceRegex, safeValue);
   });
-  context.drawImage(image, 0, 0, canvas.width, canvas.height);
-  return await new Promise<Blob>((resolve, reject) => canvas.toBlob((blob) => blob ? resolve(blob) : reject(new Error('PNG export failed')), 'image/png', .96));
+
+  return renderedSvg;
 }
 
-export async function resolvePhotoData(value: string, archive?: PhotoArchive): Promise<string | undefined> {
-  const result = findPhoto(value, archive);
-  if (!result) return undefined;
-  if (typeof result === 'string') {
-    if (result.startsWith('data:')) return result;
-    try {
-      const response = await fetch(result, { mode: 'cors' });
-      if (!response.ok) return undefined;
-      return await fileToDataUrl(new File([await response.blob()], 'remote-photo'));
-    } catch {
-      return undefined;
+// API Route Handler (Next.js App Router)
+export async function POST(req: NextRequest) {
+  try {
+    const body = await req.json();
+    const { svgContent, dataRecords } = body;
+
+    if (!svgContent) {
+      return NextResponse.json(
+        { error: "SVG content is required" },
+        { status: 400 }
+      );
     }
+
+    // Parse template fields
+    const parsed = parseSvgTemplate(svgContent);
+
+    // If data records are passed, render generated outputs
+    let renderedOutputs: string[] = [];
+    if (Array.isArray(dataRecords) && dataRecords.length > 0) {
+      renderedOutputs = dataRecords.map((record) =>
+        renderSvgWithData(parsed.cleanSvg, record)
+      );
+    }
+
+    return NextResponse.json({
+      success: true,
+      tokens: parsed.tokens,
+      hasPhotoPlaceholder: parsed.hasPhotoPlaceholder,
+      totalFieldsFound: parsed.tokens.length,
+      renderedCount: renderedOutputs.length,
+      renderedOutputs,
+    });
+  } catch (error: any) {
+    return NextResponse.json(
+      { error: error?.message || "Failed to parse template" },
+      { status: 500 }
+    );
   }
-  return await fileToDataUrl(result);
 }
