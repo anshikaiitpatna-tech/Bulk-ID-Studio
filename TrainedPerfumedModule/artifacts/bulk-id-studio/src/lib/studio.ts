@@ -1,116 +1,422 @@
-import { NextRequest, NextResponse } from "next/server";
+import Papa from 'papaparse';
+import * as XLSX from 'xlsx';
+import JSZip from 'jszip';
 
-export interface ParsedTemplateResult {
+export type SpreadsheetRow = Record<string, string>;
+
+export type PhotoArchive = {
+  files: Record<string, File>;
+  names: string[];
+};
+
+export type PhotoPlaceholder = {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  source: string;
+};
+
+export type ParsedTemplate = {
+  rawSvg: string;
   tokens: string[];
-  hasPhotoPlaceholder: boolean;
-  cleanSvg: string;
+  photoPlaceholder?: PhotoPlaceholder;
+};
+
+export type SpreadsheetData = {
+  headers: string[];
+  rows: SpreadsheetRow[];
+  embeddedPhotos?: Record<number, File>;
+};
+
+export type FieldMapping = Record<string, string>;
+
+export type GenerationIssue = {
+  row: number;
+  field: string;
+  message: string;
+  person?: string;
+};
+
+export type GeneratedCard = {
+  rowIndex: number;
+  pngBlob: Blob;
+  svgText: string;
+};
+
+const cleanToken = (value: string) =>
+  value.trim().replace(/^\{\{|\}\}$/g, '').trim();
+
+const baseName = (name: string) =>
+  name
+    .split('/')
+    .pop()
+    ?.replace(/\.[^.]+$/, '')
+    .toLowerCase() ?? '';
+
+const fileNameKey = (name: string) =>
+  name.split('/').pop()?.toLowerCase() ?? '';
+
+const escapeXml = (value: string) =>
+  value.replace(
+    /[<>&'"]/g,
+    (character) =>
+      ({
+        '<': '&lt;',
+        '>': '&gt;',
+        '&': '&amp;',
+        "'": '&apos;',
+        '"': '&quot;',
+      })[character] ?? character,
+  );
+
+function numeric(value: string | null, fallback: number) {
+  const parsed = Number.parseFloat(value ?? '');
+  return Number.isFinite(parsed) ? parsed : fallback;
 }
 
 /**
- * Parses SVG content and extracts template tokens and placeholders.
- * Handles space tolerances and missing bracket typos automatically.
+ * Parse SVG template and detect text/photo placeholders.
  */
-export function parseSvgTemplate(svgContent: string): ParsedTemplateResult {
-  if (!svgContent) {
-    return {
-      tokens: [],
-      hasPhotoPlaceholder: false,
-      cleanSvg: "",
+export function parseSvgTemplate(rawSvg: string): ParsedTemplate {
+  const found = new Set<string>();
+
+  // Detect normal {{Field}} tokens
+  for (const match of rawSvg.matchAll(
+    /\{\{\s*([^}]+?)\s*\}\}/g,
+  )) {
+    found.add(cleanToken(match[1]));
+  }
+
+  const doc = new DOMParser().parseFromString(
+    rawSvg,
+    'image/svg+xml',
+  );
+
+  let photo: PhotoPlaceholder | undefined;
+
+  const elements = Array.from(doc.querySelectorAll('*'));
+
+  for (const element of elements) {
+    const text = element.textContent?.trim() ?? '';
+    const id =
+      element.getAttribute('id')?.toLowerCase() ?? '';
+    const placeholder =
+      element
+        .getAttribute('data-placeholder')
+        ?.toLowerCase() ?? '';
+
+    const isPhotoToken =
+      element.tagName.toLowerCase() === 'text' &&
+      /\{\{\s*photo\s*\}\}/i.test(text);
+
+    const isPhoto =
+      id === 'photo-placeholder' ||
+      placeholder === 'photo' ||
+      isPhotoToken;
+
+    if (!isPhoto) continue;
+
+    found.add('Photo');
+
+    const viewBox = doc.documentElement
+      .getAttribute('viewBox')
+      ?.split(/\s+/)
+      .map(Number);
+
+    const viewWidth = viewBox?.[2] ?? 640;
+    const viewHeight = viewBox?.[3] ?? 900;
+
+    const fallbackWidth = viewWidth * 0.28;
+    const fallbackHeight =
+      fallbackWidth / 0.72;
+
+    const geometry =
+      element.matches(
+        'rect, circle, ellipse, image',
+      )
+        ? element
+        : element.querySelector(
+            'rect, circle, ellipse, image',
+          );
+
+    const xAttribute =
+      geometry?.getAttribute('x');
+
+    const yAttribute =
+      geometry?.getAttribute('y');
+
+    const widthAttribute =
+      geometry?.getAttribute('width');
+
+    const heightAttribute =
+      geometry?.getAttribute('height');
+
+    const radius = numeric(
+      geometry?.getAttribute('r') ?? null,
+      0,
+    );
+
+    const resolvedWidth =
+      widthAttribute != null
+        ? numeric(
+            widthAttribute,
+            fallbackWidth,
+          )
+        : radius > 0
+          ? radius * 2
+          : fallbackWidth;
+
+    const resolvedHeight =
+      heightAttribute != null
+        ? numeric(
+            heightAttribute,
+            fallbackHeight,
+          )
+        : radius > 0
+          ? radius * 2
+          : fallbackHeight;
+
+    const fallbackX =
+      (viewWidth - resolvedWidth) / 2;
+
+    const fallbackY =
+      viewHeight * 0.22;
+
+    const x =
+      xAttribute != null
+        ? numeric(xAttribute, fallbackX)
+        : fallbackX;
+
+    const y =
+      yAttribute != null
+        ? numeric(yAttribute, fallbackY)
+        : fallbackY;
+
+    photo = {
+      x,
+      y,
+      width: resolvedWidth,
+      height: resolvedHeight,
+      source:
+        geometry?.tagName.toLowerCase() ??
+        element.tagName.toLowerCase(),
+    };
+
+    break;
+  }
+
+  if (!photo && found.has('Photo')) {
+    const viewBox = doc.documentElement
+      .getAttribute('viewBox')
+      ?.split(/\s+/)
+      .map(Number);
+
+    photo = {
+      x: (viewBox?.[2] ?? 640) / 2 - 60,
+      y: (viewBox?.[3] ?? 900) / 2 - 75,
+      width: 120,
+      height: 150,
+      source: 'token',
     };
   }
 
-  // 1. Flexible Regex: Matches {{Token}}, {{ Token }}, and {{Token} (tolerates missing closing bracket)
-  const tokenRegex = /\{\{\s*([a-zA-Z0-9_\s-]+?)\s*\}?\}/g;
-
-  const foundTokens = new Set<string>();
-  let match: RegExpExecArray | null;
-
-  // Extract all unique token keys
-  while ((match = tokenRegex.exec(svgContent)) !== null) {
-    if (match[1]) {
-      foundTokens.add(match[1].trim());
-    }
-  }
-
-  // 2. Check for photo placeholder (matches id, class, or text token containing 'photo' or 'image')
-  const photoRegex = /(id|class)=["'](?:\w*-)*?(photo|image|avatar|picture)(?:-\w*)*?["']|\{\{\s*(photo|image)\s*\}?\}/i;
-  const hasPhotoPlaceholder = photoRegex.test(svgContent);
-
-  // 3. Normalize SVG text node breaks (join broken tspans for clean rendering)
-  let cleanedSvg = svgContent.replace(
-    /\{\{\s*([a-zA-Z0-9_\s-]+?)\s*\}?\}/g,
-    (_fullMatch, tokenName) => `{{${tokenName.trim()}}}`
-  );
-
   return {
-    tokens: Array.from(foundTokens),
-    hasPhotoPlaceholder,
-    cleanSvg: cleanedSvg,
+    rawSvg,
+    tokens: Array.from(found),
+    photoPlaceholder: photo,
   };
 }
 
 /**
- * Replaces token keys in the SVG with actual mapping data for bulk generation.
+ * Render one student's data into the SVG.
+ *
+ * IMPORTANT:
+ * The student's photo replaces the existing
+ * photo placeholder instead of adding a second image.
  */
-export function renderSvgWithData(
-  svgTemplate: string,
-  dataRecord: Record<string, string>
-): string {
-  let renderedSvg = svgTemplate;
+export function renderSvgForRow(
+  template: ParsedTemplate,
+  row: SpreadsheetRow,
+  mappings: FieldMapping,
+  photoData?: string,
+) {
+  let svg = template.rawSvg.replace(
+    /\{\{\s*([^}]+?)\s*\}\}/g,
+    (_match, rawToken: string) => {
+      const token = cleanToken(rawToken);
 
-  // Replace each mapped key with its value
-  Object.entries(dataRecord).forEach(([key, value]) => {
-    const safeValue = (value || "")
-      .replace(/&/g, "&amp;")
-      .replace(/</g, "&lt;")
-      .replace(/>/g, "&gt;")
-      .replace(/"/g, "&quot;")
-      .replace(/'/g, "&apos;");
+      // Photo is handled separately.
+      if (token.toLowerCase() === 'photo') {
+        return '';
+      }
 
-    // Replace {{Key}}, {{ Key }}, and broken bracket variants
-    const replaceRegex = new RegExp(`\\{\\{\\s*${key}\\s*\\}?\\}`, "gi");
-    renderedSvg = renderedSvg.replace(replaceRegex, safeValue);
-  });
+      const header = mappings[token];
 
-  return renderedSvg;
+      return header &&
+        header !== '__ignore__'
+        ? escapeXml(row[header] ?? '')
+        : '';
+    },
+  );
+
+  /**
+   * Replace the EXISTING photo placeholder.
+   */
+  if (template.photoPlaceholder && photoData) {
+    const doc = new DOMParser().parseFromString(
+      svg,
+      'image/svg+xml',
+    );
+
+    // First try explicit placeholder markers.
+    let photoElement =
+      doc.querySelector('#photo-placeholder') ||
+      doc.querySelector(
+        '[data-placeholder="photo"]',
+      );
+
+    /**
+     * If the SVG has {{Photo}} represented by
+     * an image element, try to find that image.
+     */
+    if (!photoElement) {
+      const images = Array.from(
+        doc.querySelectorAll('image'),
+      );
+
+      photoElement =
+        images.find((image) => {
+          const id =
+            image.getAttribute('id')
+              ?.toLowerCase() ?? '';
+
+          const dataPlaceholder =
+            image.getAttribute(
+              'data-placeholder',
+            )?.toLowerCase() ?? '';
+
+          return (
+            id.includes('photo') ||
+            id.includes('image') ||
+            id.includes('avatar') ||
+            dataPlaceholder === 'photo'
+          );
+        }) ?? null;
+    }
+
+    if (photoElement) {
+      /**
+       * IMPORTANT:
+       * Keep the existing x/y/width/height.
+       * This preserves the Canva frame position.
+       */
+      photoElement.setAttribute(
+        'href',
+        photoData,
+      );
+
+      photoElement.setAttribute(
+        'preserveAspectRatio',
+        'xMidYMid slice',
+      );
+
+      photoElement.setAttribute(
+        'data-generated-photo',
+        'true',
+      );
+
+      // Remove old SVG 1.1 image reference.
+      photoElement.removeAttribute(
+        'xlink:href',
+      );
+
+      svg = new XMLSerializer()
+        .serializeToString(doc);
+    }
+  }
+
+  return svg;
 }
 
-// API Route Handler (Next.js App Router)
-export async function POST(req: NextRequest) {
+/**
+ * Render SVG to PNG.
+ */
+export async function renderSvgToPng(
+  svgText: string,
+): Promise<Blob> {
+  const blob = new Blob(
+    [svgText],
+    { type: 'image/svg+xml' },
+  );
+
+  const url = URL.createObjectURL(blob);
+
   try {
-    const body = await req.json();
-    const { svgContent, dataRecords } = body;
+    const image = new Image();
 
-    if (!svgContent) {
-      return NextResponse.json(
-        { error: "SVG content is required" },
-        { status: 400 }
-      );
-    }
+    await new Promise<void>(
+      (resolve, reject) => {
+        image.onload = () => resolve();
+        image.onerror = () =>
+          reject(
+            new Error(
+              'Failed to load rendered SVG',
+            ),
+          );
 
-    // Parse template fields
-    const parsed = parseSvgTemplate(svgContent);
-
-    // If data records are passed, render generated outputs
-    let renderedOutputs: string[] = [];
-    if (Array.isArray(dataRecords) && dataRecords.length > 0) {
-      renderedOutputs = dataRecords.map((record) =>
-        renderSvgWithData(parsed.cleanSvg, record)
-      );
-    }
-
-    return NextResponse.json({
-      success: true,
-      tokens: parsed.tokens,
-      hasPhotoPlaceholder: parsed.hasPhotoPlaceholder,
-      totalFieldsFound: parsed.tokens.length,
-      renderedCount: renderedOutputs.length,
-      renderedOutputs,
-    });
-  } catch (error: any) {
-    return NextResponse.json(
-      { error: error?.message || "Failed to parse template" },
-      { status: 500 }
+        image.src = url;
+      },
     );
+
+    const width =
+      image.naturalWidth || 640;
+
+    const height =
+      image.naturalHeight || 900;
+
+    const canvas =
+      document.createElement('canvas');
+
+    canvas.width = width;
+    canvas.height = height;
+
+    const context =
+      canvas.getContext('2d');
+
+    if (!context) {
+      throw new Error(
+        'Could not create canvas context',
+      );
+    }
+
+    context.drawImage(
+      image,
+      0,
+      0,
+      width,
+      height,
+    );
+
+    return await new Promise<Blob>(
+      (resolve, reject) => {
+        canvas.toBlob(
+          (result) => {
+            if (result) {
+              resolve(result);
+            } else {
+              reject(
+                new Error(
+                  'Failed to create PNG',
+                ),
+              );
+            }
+          },
+          'image/png',
+        );
+      },
+    );
+  } finally {
+    URL.revokeObjectURL(url);
   }
 }
