@@ -1,0 +1,28 @@
+kind = "web"
+previewPath = "/"
+title = "Bulk ID Studio"
+description = "A focused bulk document generator that turns one SVG ID-card or certificate template and a spreadsheet into press-ready cards, with photo matching, validation, batch preview, ZIP export, and print-ready PDF output."
+version = "1.0.0"
+id = "artifacts/bulk-id-studio"
+router = "path"
+
+[[services]]
+name = "web"
+paths = [ "/" ]
+localPort = 19012
+
+[services.development]
+run = "pnpm --filter @workspace/bulk-id-studio run dev"
+
+[services.production]
+build = [ "pnpm", "--filter", "@workspace/bulk-id-studio", "run", "build" ]
+serve = "static"
+publicDir = "artifacts/bulk-id-studio/dist/public"
+
+[[services.production.rewrites]]
+from = "/*"
+to = "/index.html"
+
+[services.env]
+PORT = "19012"
+BASE_PATH = "/"
