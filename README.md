@@ -1,4 +1,5 @@
 Live: bulk-id-studio.vercel.app
+
 Turn one SVG design template and a spreadsheet into hundreds of press-ready ID cards — no manual copy-pasting in Canva or Illustrator.
 Built for the IIT Patna Alumni & International Relations Cell to automate Alumni ID card generation for 250+ recipients.
 What it does
